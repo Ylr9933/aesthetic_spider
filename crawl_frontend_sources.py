@@ -75,7 +75,13 @@ class Archive:
         target = normalized(record['target'])
         existing_meta={}
         if existing_folder and (Path(existing_folder)/'metadata.json').exists():
-            existing_meta=json.loads((Path(existing_folder)/'metadata.json').read_text(encoding='utf-8'))
+            try:
+                existing_meta=json.loads((Path(existing_folder)/'metadata.json').read_text(encoding='utf-8'))
+            except (ValueError,OSError):
+                # Legacy interrupted writes can leave an empty metadata file.
+                # Retain the old files but don't reuse them as verified successes.
+                existing_folder=None
+                existing_status=None
             if existing_meta.get('final_url'):
                 target=normalized(existing_meta['final_url'])
         if host(target) in self.gallery_hosts and not (source=='codrops' and re.match(r'^/(?:Tutorials|Development)/',urlsplit(target).path)):

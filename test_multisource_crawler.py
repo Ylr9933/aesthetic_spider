@@ -100,6 +100,16 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive.db.execute("SELECT url FROM jobs WHERE kind='resolve'").fetchone()[0],
                          'https://onepagelove.com/go/unresolved')
 
+    async def test_interrupted_legacy_metadata_requeues_without_losing_files(self):
+        folder=self.out/'interrupted'
+        folder.mkdir()
+        (folder/'metadata.json').write_text('',encoding='utf-8')
+        (folder/'source.html').write_text('<html>incomplete</html>',encoding='utf-8')
+        self.archive.add_site('httpster',{'target':'https://actual.example/','title':'Example',
+            'entry_url':'https://httpster.net/website/example/','evidence':'legacy'},folder,'downloaded')
+        self.assertEqual(self.archive.db.execute('SELECT status FROM sites').fetchone()[0],'pending')
+        self.assertTrue((folder/'source.html').exists())
+
     async def test_stop_cancels_blocked_http_and_preserves_queue(self):
         root=self.out/'pause-test'
         root.mkdir()
