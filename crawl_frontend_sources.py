@@ -16,18 +16,19 @@ import shutil
 import sqlite3
 import stat
 import sys
+import threading
 import time
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path, PurePosixPath
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
-from bs4 import BeautifulSoup
-
 from crawl_onepagelove import AGENT, Robots, FetchError, capture, now, normalized, atomic_json
-from source_adapters import extract, extract_payload, host, directory_url, repository_url, is_detail, target_url
+from source_adapters import extract_document, extract_payload, host, directory_url, repository_url, is_detail, target_url
 
 SUCCESS = {'downloaded','downloaded_partial','captured','captured_partial','code_saved','repository_saved'}
 
@@ -49,6 +50,9 @@ class Archive:
               folder TEXT, error TEXT, result TEXT, updated TEXT,
               PRIMARY KEY(kind,source,url));
             CREATE INDEX IF NOT EXISTS queue ON jobs(kind,status,source,priority);
+            CREATE INDEX IF NOT EXISTS jobs_target ON jobs(kind,url);
+            CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status);
+            CREATE INDEX IF NOT EXISTS jobs_source_status ON jobs(source,kind,status);
             CREATE TABLE IF NOT EXISTS sites (
               target TEXT PRIMARY KEY, source TEXT, title TEXT, status TEXT DEFAULT 'pending',
               folder TEXT, final_url TEXT, html_sha256 TEXT, updated TEXT);
@@ -60,12 +64,16 @@ class Archive:
               PRIMARY KEY(source,page_url,sha256));
             CREATE TABLE IF NOT EXISTS source_state (
               source TEXT PRIMARY KEY, seed_url TEXT, status TEXT, error TEXT, updated TEXT);
+            CREATE INDEX IF NOT EXISTS provenance_source ON provenance(source,target);
+            CREATE INDEX IF NOT EXISTS component_hash ON components(sha256);
+            CREATE INDEX IF NOT EXISTS sites_status ON sites(status);
         ''')
         self.db.execute("UPDATE jobs SET status='pending' WHERE status='running'")
         self.db.execute("UPDATE sites SET status='pending' WHERE status='running'")
         self.db.commit()
         self.started, self.phase, self.completed = now(), 'starting', 0
         self.offsets = Counter()
+        self.loop_lags=[]
 
     def add_job(self, kind, source, url, depth=0, priority=2, title=''):
         self.db.execute('INSERT OR IGNORE INTO jobs(kind,source,url,depth,priority,title,updated) VALUES(?,?,?,?,?,?,?)',
@@ -164,27 +172,33 @@ class Archive:
             folder = self.out/'components'/source/key(page_url)
             folder.mkdir(parents=True,exist_ok=True)
             path = folder/(digest[:24]+ext)
-            path.write_text(snippet['code'],encoding='utf-8')
-            self.db.execute('INSERT OR IGNORE INTO components VALUES(?,?,?,?,?,?)',
+            inserted=self.db.execute('INSERT OR IGNORE INTO components VALUES(?,?,?,?,?,?)',
                             (source,page_url,digest,snippet['language'],str(path.resolve()),snippet['evidence']))
+            if not inserted.rowcount and path.exists() and path.with_suffix(path.suffix+'.json').exists():
+                continue
+            path.write_text(snippet['code'],encoding='utf-8')
             atomic_json(path.with_suffix(path.suffix+'.json'),{
                 'source':source,'page_url':page_url,'code_kind':'public_component_source',
                 'language':snippet['language'],'sha256':digest,'evidence':snippet['evidence'],
                 'rendered':False,'screenshots':False,'license':'not_verified',
                 'dependencies':'not_evaluated','collected_at':now()})
 
-    def export(self, full=False):
+    def export(self, full=False, db=None):
+        db=self.db if db is None else db
         report = {'started_at':self.started,'updated_at':now(),'phase':self.phase,'pid':os.getpid(),
                   'mode':'http_only','browser':False,'screenshots':False,'source_count':len(self.sources),
                   'completed_jobs_this_run':self.completed,
-                  'sites':dict(self.db.execute('SELECT status,COUNT(*) FROM sites GROUP BY status')),
-                  'jobs':[dict(kind=k,status=s,count=n) for k,s,n in self.db.execute('SELECT kind,status,COUNT(*) FROM jobs GROUP BY kind,status')],
-                  'components':self.db.execute('SELECT COUNT(*) FROM components').fetchone()[0],
-                  'component_unique_hashes':self.db.execute('SELECT COUNT(DISTINCT sha256) FROM components').fetchone()[0],
+                  'event_loop_lag_ms':{'samples':len(self.loop_lags),
+                      'mean':round(sum(self.loop_lags)/max(len(self.loop_lags),1)*1000,2),
+                      'max':round(max(self.loop_lags,default=0)*1000,2)},
+                  'sites':dict(db.execute('SELECT status,COUNT(*) FROM sites GROUP BY status')),
+                  'jobs':[dict(kind=k,status=s,count=n) for k,s,n in db.execute('SELECT kind,status,COUNT(*) FROM jobs GROUP BY kind,status')],
+                  'components':db.execute('SELECT COUNT(*) FROM components').fetchone()[0],
+                  'component_unique_hashes':db.execute('SELECT COUNT(DISTINCT sha256) FROM components').fetchone()[0],
                   'sources':{sid:{'url':source['url'],'kind':source['kind'],
-                      'state':self.db.execute('SELECT status,error FROM source_state WHERE source=?',(sid,)).fetchone(),
-                      'discovery':dict(self.db.execute("SELECT status,COUNT(*) FROM jobs WHERE source=? AND kind IN ('discovery','sitemap','payload') GROUP BY status",(sid,))),
-                      'targets':self.db.execute('SELECT COUNT(DISTINCT target) FROM provenance WHERE source=?',(sid,)).fetchone()[0]}
+                      'state':db.execute('SELECT status,error FROM source_state WHERE source=?',(sid,)).fetchone(),
+                      'discovery':dict(db.execute("SELECT status,COUNT(*) FROM jobs WHERE source=? AND kind IN ('discovery','sitemap','payload') GROUP BY status",(sid,))),
+                      'targets':db.execute('SELECT COUNT(DISTINCT target) FROM provenance WHERE source=?',(sid,)).fetchone()[0]}
                     for sid,source in self.sources.items()},
                   'output':str(self.out),'stop_file':str(self.out/'STOP')}
         atomic_json(self.out/'progress.json',report)
@@ -193,31 +207,47 @@ class Archive:
         with (self.out/'sites_manifest.csv.tmp').open('w',encoding='utf-8-sig',newline='') as f:
             writer=csv.writer(f)
             writer.writerow(['target_url','final_url','title','status','sources','local_html','local_assets','metadata','html_sha256'])
-            for target,final,title,status,folder,digest in self.db.execute('SELECT target,final_url,title,status,folder,html_sha256 FROM sites'):
+            for target,final,title,status,folder,digest in db.execute('SELECT target,final_url,title,status,folder,html_sha256 FROM sites'):
                 if status not in SUCCESS or not folder or not (Path(folder)/'source.html').exists():
                     continue
-                sources=';'.join(r[0] for r in self.db.execute('SELECT DISTINCT source FROM provenance WHERE target=?',(target,)))
+                sources=';'.join(r[0] for r in db.execute('SELECT DISTINCT source FROM provenance WHERE target=?',(target,)))
                 writer.writerow([target,final,title,status,sources,str(Path(folder)/'source.html'),str(Path(folder)/'assets'),str(Path(folder)/'metadata.json'),digest])
         (self.out/'sites_manifest.csv.tmp').replace(self.out/'sites_manifest.csv')
         with (self.out/'components_manifest.jsonl.tmp').open('w',encoding='utf-8') as f:
-            for row in self.db.execute('SELECT source,page_url,sha256,language,file,evidence FROM components'):
+            for row in db.execute('SELECT source,page_url,sha256,language,file,evidence FROM components'):
                 f.write(json.dumps(dict(zip(['source','page_url','sha256','language','file','evidence'],row)),ensure_ascii=False)+'\n')
         (self.out/'components_manifest.jsonl.tmp').replace(self.out/'components_manifest.jsonl')
         with (self.out/'catalog.jsonl.tmp').open('w',encoding='utf-8') as f:
-            for row in self.db.execute('SELECT kind,source,url,status,folder,error,result FROM jobs'):
+            for row in db.execute('SELECT kind,source,url,status,folder,error,result FROM jobs'):
                 f.write(json.dumps(dict(zip(['kind','source','url','status','folder','error','result'],row)),ensure_ascii=False)+'\n')
         (self.out/'catalog.jsonl.tmp').replace(self.out/'catalog.jsonl')
         with (self.out/'provenance.jsonl.tmp').open('w',encoding='utf-8') as f:
-            for row in self.db.execute('SELECT target,source,entry_url,evidence FROM provenance'):
+            for row in db.execute('SELECT target,source,entry_url,evidence FROM provenance'):
                 f.write(json.dumps(dict(zip(['target','source','entry_url','evidence'],row)),ensure_ascii=False)+'\n')
         (self.out/'provenance.jsonl.tmp').replace(self.out/'provenance.jsonl')
         atomic_json(self.out/'source_report.json',report['sources'])
         with (self.out/'repositories_manifest.jsonl.tmp').open('w',encoding='utf-8') as f:
-            for source,url,folder,result in self.db.execute("SELECT source,url,folder,result FROM jobs WHERE kind='repo' AND status='repository_saved'"):
+            for source,url,folder,result in db.execute("SELECT source,url,folder,result FROM jobs WHERE kind='repo' AND status='repository_saved'"):
                 f.write(json.dumps({'source':source,'repository_url':url,'local_source':str(Path(folder)/'source'),
                                     'metadata':str(Path(folder)/'metadata.json'),'details':json.loads(result)},ensure_ascii=False)+'\n')
         (self.out/'repositories_manifest.jsonl.tmp').replace(self.out/'repositories_manifest.jsonl')
         return report
+
+    def export_snapshot(self, full=False):
+        # A separate read transaction keeps each manifest consistent while the
+        # event loop continues downloading and writing to the WAL database.
+        with closing(sqlite3.connect((self.out/'state.sqlite').resolve().as_uri()+'?mode=ro',uri=True)) as db:
+            db.execute('BEGIN')
+            return self.export(full=full,db=db)
+
+    async def export_async(self, full=False):
+        task=asyncio.create_task(asyncio.to_thread(self.export_snapshot,full))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Do not leave a writer replacing manifests after the final export.
+            await task
+            raise
 
 
 def import_onepagelove(archive, root):
@@ -260,11 +290,11 @@ async def discover(job, archive, robots, args, gallery_hosts):
     response = await robots.fetch(job['url'],max_bytes=12*1024**2,minimum=args.directory_delay,timeout=40)
     final = response['final_url']
     folder = archive.out/'directory'/source['id']
-    folder.mkdir(parents=True,exist_ok=True)
+    await robots.io(folder.mkdir,parents=True,exist_ok=True)
     raw = response['body']
     path = folder/(key(job['url'])+('.xml' if job['kind']=='sitemap' else '.json' if job['kind']=='payload' else '.html'))
-    path.write_bytes(raw)
-    atomic_json(path.with_suffix(path.suffix+'.json'),{'requested_url':job['url'],'final_url':final,'fetched_at':now(),'http_status':response['status']})
+    await robots.io(path.write_bytes,raw)
+    await robots.io(atomic_json,path.with_suffix(path.suffix+'.json'),{'requested_url':job['url'],'final_url':final,'fetched_at':now(),'http_status':response['status']})
     if host(final) != host(source['url']):
         raise RuntimeError('directory_redirected_to_other_host: '+final)
     if job['kind']=='payload':
@@ -315,11 +345,7 @@ async def discover(job, archive, robots, args, gallery_hosts):
                         archive.add_site(source['id'],{'target':url,'title':host(url),'entry_url':job['url'],'evidence':'public_sitemap'})
         archive.db.commit()
         return 'discovered',path,{'format':'sitemap'}
-    soup = BeautifulSoup(raw,'html.parser')
-    title = soup.title.get_text(' ',strip=True).lower() if soup.title else ''
-    if any(t in title for t in ('just a moment','verify you are human','access denied','attention required')):
-        raise RuntimeError('challenge_page')
-    result = extract(source,raw,final,gallery_hosts)
+    result = await robots.process(extract_document,source,raw,final,gallery_hosts)
     for record in result['targets']:
         archive.add_site(source['id'],record)
     for url in result['follow']:
@@ -364,8 +390,8 @@ async def download_site(job, archive, robots, args, gallery_hosts):
             meta['status'],meta['error'] = 'redirect_to_gallery','Target redirected back to a discovery source'
     raw = folder/'source.html'
     if raw.exists():
-        meta['html_sha256'] = hashlib.sha256(raw.read_bytes()).hexdigest()
-    atomic_json(folder/'metadata.json',meta)
+        meta['html_sha256'] = await robots.io(hash_file,raw)
+    await robots.io(atomic_json,folder/'metadata.json',meta)
     return meta['status'],folder,meta
 
 
@@ -383,25 +409,48 @@ async def resolve_redirect(job,archive,robots,args,gallery_hosts):
 async def download_repo(job, archive, robots, args):
     parts = urlsplit(job['url']).path.strip('/').split('/')[:2]
     folder = archive.out/'repositories'/(parts[0]+'--'+parts[1])
-    folder.mkdir(parents=True,exist_ok=True)
+    if robots is not None:
+        await robots.io(folder.mkdir,parents=True,exist_ok=True)
+    else:
+        folder.mkdir(parents=True,exist_ok=True)
     url = 'https://codeload.github.com/'+'/'.join(parts)+'/zip/HEAD'
     archive_file,temp = folder/'source.zip',folder/'source.zip.part'
     if not archive_file.exists() or not zipfile.is_zipfile(archive_file):
         try:
             await robots.fetch(url,max_bytes=args.max_repo_bytes,minimum=1,destination=temp,timeout=300)
-            temp.replace(archive_file)
+            await robots.io(temp.replace,archive_file)
         finally:
-            temp.unlink(missing_ok=True)
+            await robots.io(temp.unlink,missing_ok=True)
+    if robots is None:
+        meta=extract_repository(job,folder,archive_file,url,args.max_repo_bytes)
+    else:
+        cancelled=threading.Event()
+        meta=await robots.io(extract_repository,job,folder,archive_file,url,args.max_repo_bytes,cancelled,
+                             _cancel_event=cancelled)
+    return 'repository_saved',folder,meta
+
+
+def hash_file(path):
+    digest=hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda:handle.read(65536),b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def extract_repository(job,folder,archive_file,url,max_repo_bytes,cancelled=None):
     files,bytes_written,licenses = 0,0,[]
     dest = (folder/'source').resolve()
     dest.mkdir(exist_ok=True)
     with zipfile.ZipFile(archive_file) as bundle:
         members = bundle.infolist()
-        if len(members) > 150000 or sum(m.file_size for m in members) > args.max_repo_bytes*8:
+        if len(members) > 150000 or sum(m.file_size for m in members) > max_repo_bytes*8:
             raise RuntimeError('repository_extract_budget')
         roots = {PurePosixPath(m.filename).parts[0] for m in members if PurePosixPath(m.filename).parts}
         single_root = len(roots) == 1
         for entry in members:
+            if cancelled is not None and cancelled.is_set():
+                raise RuntimeError('repository_extraction_interrupted')
             relative = PurePosixPath(entry.filename)
             if single_root:
                 relative = PurePosixPath(*relative.parts[1:])
@@ -418,12 +467,14 @@ async def download_repo(job, archive, robots, args):
                 raise RuntimeError('unsafe_archive_path')
             target.parent.mkdir(parents=True,exist_ok=True)
             with bundle.open(entry) as input_file,target.open('wb') as output_file:
-                shutil.copyfileobj(input_file,output_file,65536)
+                for chunk in iter(lambda:input_file.read(65536),b''):
+                    if cancelled is not None and cancelled.is_set():
+                        raise RuntimeError('repository_extraction_interrupted')
+                    output_file.write(chunk)
             files += 1
             bytes_written += entry.file_size
             if re.match(r'^(?:LICENSE|COPYING|NOTICE)',target.name,re.I):
                 licenses.append(target.relative_to(dest).as_posix())
-            await asyncio.sleep(0)
         revision = bundle.comment.decode('ascii','replace')
     meta = {'repository_url':job['url'],'archive_url':url,'revision_comment':revision,
             'source':job['source'],'code_kind':'public_repository_source','original_project_source':True,
@@ -431,7 +482,7 @@ async def download_repo(job, archive, robots, args):
             'license':'inspect_license_files' if licenses else 'not_found',
             'dependencies':'not_evaluated','rendered':False,'screenshots':False,'collected_at':now()}
     atomic_json(folder/'metadata.json',meta)
-    return 'repository_saved',folder,meta
+    return meta
 
 
 async def main(args):
@@ -454,6 +505,8 @@ async def main(args):
     archive=Archive(out,sources)
     gallery_hosts={host(s['url']) for s in json.loads(Path(args.config).read_text(encoding='utf-8'))['sources']}
     stop=asyncio.Event()
+    process_pool=ProcessPoolExecutor(max_workers=args.parse_workers)
+    io_pool=ThreadPoolExecutor(max_workers=8,thread_name_prefix='archive-io')
     jobs=[]
     start=time.monotonic()
     try:
@@ -476,6 +529,9 @@ async def main(args):
         connector=aiohttp.TCPConnector(limit=args.connections,limit_per_host=args.per_host,ttl_dns_cache=300)
         async with aiohttp.ClientSession(connector=connector,headers={'User-Agent':AGENT}) as session:
             robots=Robots(session,out,connections=args.connections)
+            robots.process_pool=process_pool
+            robots.process_slots=asyncio.Semaphore(args.parse_workers*2)
+            robots.io_pool=io_pool
             claimed=Counter()
 
             async def worker(kind):
@@ -517,7 +573,10 @@ async def main(args):
 
             async def control():
                 idle=0
+                expected=time.monotonic()
                 while not stop.is_set():
+                    archive.loop_lags.append(max(0,time.monotonic()-expected))
+                    archive.loop_lags=archive.loop_lags[-120:]
                     if (out/'STOP').exists():
                         archive.phase='stopped'
                         stop.set()
@@ -540,12 +599,13 @@ async def main(args):
                         archive.phase='sample_complete' if args.discovery_limit or args.site_limit or args.repo_limit else 'frontier_exhausted'
                         stop.set()
                         return
+                    expected=time.monotonic()+.5
                     await asyncio.sleep(.5)
 
             async def reporter():
                 tick=0
                 while not stop.is_set():
-                    archive.export(full=tick%6==0)
+                    await archive.export_async(full=tick%6==0)
                     tick+=1
                     await asyncio.sleep(10)
 
@@ -571,10 +631,12 @@ async def main(args):
         archive.db.commit()
         if archive.phase=='crawling':
             archive.phase='interrupted'
-        report=archive.export(full=True)
+        report=await archive.export_async(full=True)
         report['pid']=None
         atomic_json(out/'progress.json',report)
         archive.db.close()
+        await asyncio.to_thread(process_pool.shutdown,wait=True,cancel_futures=True)
+        await asyncio.to_thread(io_pool.shutdown,wait=True,cancel_futures=True)
         lock.unlink(missing_ok=True)
         print(json.dumps({'event':'finished','phase':report['phase'],'sites':report['sites'],'components':report['components']},ensure_ascii=False),flush=True)
 
@@ -591,6 +653,7 @@ def arguments():
     parser.add_argument('--asset-workers',type=int,default=8)
     parser.add_argument('--discovery-workers',type=int,default=24)
     parser.add_argument('--repo-workers',type=int,default=2)
+    parser.add_argument('--parse-workers',type=int,default=2,help='Processes for HTML and text-asset analysis')
     parser.add_argument('--directory-delay',type=float,default=.8)
     parser.add_argument('--max-resources',type=int,default=500)
     parser.add_argument('--site-timeout',type=int,default=120)
@@ -602,7 +665,7 @@ def arguments():
     parser.add_argument('--discovery-limit',type=int,default=0,help='Maximum processed HTML pages per source; zero means unlimited')
     parser.add_argument('--retry-failed',action='store_true')
     args=parser.parse_args()
-    if min(args.workers,args.connections,args.per_host,args.asset_workers,args.discovery_workers,args.repo_workers,args.max_resources,args.site_timeout)<1:
+    if min(args.workers,args.connections,args.per_host,args.asset_workers,args.discovery_workers,args.repo_workers,args.parse_workers,args.max_resources,args.site_timeout)<1:
         parser.error('Concurrency and resource limits must be positive')
     if min(args.run_seconds,args.site_limit,args.repo_limit,args.discovery_limit,args.max_discovery_depth)<0 or args.directory_delay<0:
         parser.error('Limits and delays cannot be negative')

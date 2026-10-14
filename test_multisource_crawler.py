@@ -2,13 +2,16 @@
 import asyncio
 import json
 import tempfile
+import threading
 import unittest
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import crawl_frontend_sources as multi
+from crawl_onepagelove import Robots, analyze_page
 from source_adapters import extract, extract_payload, decode_nuxt
 
 
@@ -73,6 +76,93 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.archive.db.execute("SELECT COUNT(*) FROM jobs WHERE kind='site'").fetchone()[0],1)
         self.assertEqual(self.archive.db.execute('SELECT COUNT(*) FROM provenance').fetchone()[0],2)
 
+    async def test_manifest_export_allows_download_completion_and_closes_reader(self):
+        self.archive.db.commit()
+        entered,release=threading.Event(),threading.Event()
+        original=self.archive.export
+
+        def slow_export(*args,**kwargs):
+            entered.set()
+            release.wait(3)
+            return original(*args,**kwargs)
+
+        with patch.object(self.archive,'export',slow_export):
+            task=asyncio.create_task(self.archive.export_async(full=True))
+            try:
+                await asyncio.wait_for(asyncio.to_thread(entered.wait),2)
+                self.archive.add_site('httpster',{'target':'https://new.example/','title':'New',
+                                                'entry_url':'https://httpster.net/','evidence':'visit'})
+                self.archive.db.commit()
+                self.assertFalse(task.done())
+            finally:
+                release.set()
+            await task
+        self.assertEqual((await self.archive.export_async())['sites'],{'pending':1})
+
+    async def test_process_analysis_preserves_html_references_and_text(self):
+        raw=b'<title>Demo</title><base href="https://cdn.example/assets/"><img data-src="lazy.png"><style>.a{background:url(bg.png)}</style>'
+        expected=analyze_page(raw,'https://demo.example/')
+        pool=ProcessPoolExecutor(max_workers=1)
+        robots=Robots(None,self.out)
+        robots.process_pool=pool
+        robots.process_slots=asyncio.Semaphore(2)
+        try:
+            actual=await asyncio.wait_for(robots.process(analyze_page,raw,'https://demo.example/'),15)
+            self.assertEqual(actual,expected)
+            self.assertEqual(actual['references'],['https://cdn.example/assets/lazy.png','https://cdn.example/assets/bg.png'])
+        finally:
+            await asyncio.to_thread(pool.shutdown,wait=True,cancel_futures=True)
+
+    async def test_cancelled_analysis_still_limits_unfinished_work(self):
+        entered,release,second_entered=threading.Event(),threading.Event(),threading.Event()
+        pool=ThreadPoolExecutor(max_workers=2)
+        robots=Robots(None,self.out)
+        robots.process_pool=pool
+        robots.process_slots=asyncio.Semaphore(1)
+
+        def slow_analysis():
+            entered.set()
+            release.wait(3)
+
+        try:
+            first=asyncio.create_task(robots.process(slow_analysis))
+            await asyncio.wait_for(asyncio.to_thread(entered.wait),2)
+            first.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            second=asyncio.create_task(robots.process(second_entered.set))
+            await asyncio.sleep(.05)
+            self.assertFalse(second_entered.is_set())
+            release.set()
+            await asyncio.wait_for(second,2)
+            self.assertTrue(second_entered.is_set())
+        finally:
+            release.set()
+            await asyncio.to_thread(pool.shutdown,wait=True,cancel_futures=True)
+
+    async def test_cancelled_export_finishes_before_final_manifest(self):
+        self.archive.db.commit()
+        entered,release=threading.Event(),threading.Event()
+        original=self.archive.export
+
+        def slow_export(*args,**kwargs):
+            entered.set()
+            release.wait(3)
+            return original(*args,**kwargs)
+
+        with patch.object(self.archive,'export',slow_export):
+            task=asyncio.create_task(self.archive.export_async(full=True))
+            await asyncio.wait_for(asyncio.to_thread(entered.wait),2)
+            task.cancel()
+            await asyncio.sleep(.05)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.archive.phase='stopped'
+        await self.archive.export_async(full=True)
+        self.assertEqual(json.loads((self.out/'progress.json').read_text(encoding='utf-8'))['phase'],'stopped')
+
     async def test_unsafe_zip_cannot_escape_repository_folder(self):
         folder=self.out/'repositories'/'owner--repo'
         folder.mkdir(parents=True)
@@ -82,6 +172,33 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
             await multi.download_repo({'url':'https://github.com/owner/repo','source':'httpster'},
                                       self.archive,None,SimpleNamespace(max_repo_bytes=1024**2))
         self.assertFalse((self.out/'outside.html').exists())
+
+    async def test_cancel_repository_extraction_without_background_writes(self):
+        folder=self.out/'repositories'/'owner--repo'
+        folder.mkdir(parents=True)
+        with zipfile.ZipFile(folder/'source.zip','w') as z:
+            z.writestr('repo-HEAD/index.html','<title>Example</title>')
+        entered=threading.Event()
+        pool=ThreadPoolExecutor(max_workers=2)
+        robots=Robots(None,self.out)
+        robots.io_pool=pool
+
+        def blocked_extract(job,folder,archive_file,url,max_bytes,cancelled):
+            entered.set()
+            cancelled.wait(3)
+            raise RuntimeError('repository_extraction_interrupted')
+
+        try:
+            with patch.object(multi,'extract_repository',blocked_extract):
+                task=asyncio.create_task(multi.download_repo({'url':'https://github.com/owner/repo','source':'httpster'},
+                    self.archive,robots,SimpleNamespace(max_repo_bytes=1024**2)))
+                await asyncio.wait_for(asyncio.to_thread(entered.wait),2)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task,1)
+            self.assertFalse((folder/'metadata.json').exists())
+        finally:
+            await asyncio.to_thread(pool.shutdown,wait=True,cancel_futures=True)
 
     async def test_legacy_gallery_redirect_indexes_real_landing_url(self):
         self.archive.sources['onepagelove']={'id':'onepagelove','url':'https://onepagelove.com/','kind':'gallery'}

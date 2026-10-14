@@ -13,6 +13,14 @@
 目录同源间隔至少 0.8 秒，继续遵守 robots 的更长间隔。
 不使用浏览器、不执行网站 JavaScript、不截图。
 
+本地处理默认使用 `--parse-workers 2` 个独立进程解析目录 HTML、目标页和资源引用，
+限制等待的解析任务，避免大量下载任务同时挤占内存。HTML 只解析一次；同一组件重复发现时复用已存文件。
+数据库自动补建目标去重、任务状态和来源统计索引，可直接升级已有归档。
+流式写盘、文件重命名和仓库解压使用 8 个专用 I/O 线程，避免占用下载调度线程和 DNS 线程。
+仓库解压在取消时于文件块之间退出；文件写入结束后才执行删除和重命名，避免后台写盘与暂停清理冲突。
+清单与进度通过独立只读数据库事务在后台线程导出，不阻塞 HTTP 调度；暂停时等待导出结束再写最终清单。
+`progress.json` 的 `event_loop_lag_ms` 记录最近约一分钟的调度延迟，可观察本地阻塞是否复发。
+
 采集路径：公开目录 / sitemap → 作品详情 → 被收录网站或演示页 → HTML 和静态引用资源。
 组件站提取公开代码块、iframe srcdoc、公开 JSON 内嵌代码，并下载其明确链接的 GitHub 源码包。
 FWA 使用其前端公开调用的 `/api/cases/` 分页 GET；MaxiBestOf 等读取页面明确引用的 Nuxt JSON。
@@ -62,6 +70,9 @@ Remove-Item -LiteralPath data/frontend_archive/STOP
 
 # 本地集成与提取/去重/暂停/ZIP 路径安全测试
 .\.venv\Scripts\python.exe -m unittest -v test_http_crawler test_multisource_crawler
+
+# 使用已保存的真实页面做本地 SQL 和 HTML 提取基准，不请求网络
+.\.venv\Scripts\python.exe benchmark_local.py
 ```
 
 未指定限额时默认持续处理至已发现队列用尽。`--retry-failed` 会把失败和 robots 跳过任务重新入队，

@@ -3,6 +3,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -79,9 +80,12 @@ class HttpArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.url_patch.start()
         self.session = aiohttp.ClientSession()
         self.robots = crawler.Robots(self.session, self.out, connections=2)
+        self.io_pool=ThreadPoolExecutor(max_workers=2)
+        self.robots.io_pool=self.io_pool
         self.args = SimpleNamespace(asset_workers=4, max_resources=40)
 
     async def asyncTearDown(self):
+        await asyncio.to_thread(self.io_pool.shutdown,wait=True,cancel_futures=True)
         await self.session.close()
         await self.runner.cleanup()
         self.url_patch.stop()

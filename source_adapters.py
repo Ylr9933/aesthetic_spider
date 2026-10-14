@@ -63,6 +63,7 @@ SOCIAL_HOSTS = {'twitter.com','x.com','facebook.com','instagram.com','pinterest.
                 'v0.dev','producthunt.com','chrome.google.com','addons.mozilla.org','stumbleupon.com',
                 'framer.link','dub.sh','buy.polar.sh','gumroad.com','lemonsqueezy.com','try.webflow.com'}
 VISIT = re.compile(r'\b(?:visit(?:\s+(?:the\s+)?(?:web)?site)?|view\s+(?:live\s+)?(?:site|website|demo)|launch\s+(?:site|website|demo)|live\s+(?:preview|demo)|show\s+preview|open\s+(?:website|site)|view\s+website)\b', re.I)
+CHROME = re.compile(r'(?:^|[-_ ])(?:sponsor|advert|ads|banner|partner)(?:[-_ ]|$)',re.I)
 
 
 def host(url):
@@ -118,7 +119,7 @@ def repository_url(url):
 def json_documents(soup):
     """Decode data only, never eval/execute script. Handles JSON and Next RSC strings."""
     decoder = json.JSONDecoder()
-    for script in soup.select('script'):
+    for script in soup.find_all('script'):
         if script.get('src'):
             continue
         text = script.get_text().strip()
@@ -204,8 +205,16 @@ def walk_objects(value):
             stack.extend(v for v in current if isinstance(v, (dict,list)))
 
 
-def extract(source, raw, page_url, gallery_hosts):
-    soup = BeautifulSoup(raw, 'html.parser')
+def extract_document(source, raw, page_url, gallery_hosts):
+    soup=BeautifulSoup(raw,'html.parser')
+    title=soup.title.get_text(' ',strip=True).lower() if soup.title else ''
+    if any(t in title for t in ('just a moment','verify you are human','access denied','attention required')):
+        raise RuntimeError('challenge_page')
+    return extract(source,raw,page_url,gallery_hosts,soup=soup)
+
+
+def extract(source, raw, page_url, gallery_hosts, soup=None):
+    soup = BeautifulSoup(raw, 'html.parser') if soup is None else soup
     targets, follow, repos, snippets = {}, set(), set(), {}
     payloads=set()
     heading = soup.select_one('h1')
@@ -232,17 +241,21 @@ def extract(source, raw, page_url, gallery_hosts):
                 name = a.get_text(' ', strip=True) or (image.get('alt') if image else '')
                 add(a['href'], name, 'selector:'+selector)
 
-    for a in soup.select('a[href]'):
+    for a in soup.find_all('a',href=True):
         try:
             full = normalized(urljoin(page_url, a['href']))
             if directory_url(source, full):
                 follow.add(full)
         except ValueError:
             continue
-        text = ' '.join(str(a.get(k,'')) for k in ('title','aria-label'))+' '+a.get_text(' ',strip=True)
-        chrome = a.find_parent(['footer','nav','aside']) or a.find_parent(class_=re.compile(r'(?:^|[-_ ])(?:sponsor|advert|ads|banner|partner)(?:[-_ ]|$)',re.I))
-        visit_text = a.get_text(' ',strip=True) if sid == 'sitesee' else text
-        if VISIT.search(visit_text) and not chrome:
+        anchor_text=a.get_text(' ',strip=True)
+        text = ' '.join(str(a.get(k,'')) for k in ('title','aria-label'))+' '+anchor_text
+        visit_text = anchor_text if sid == 'sitesee' else text
+        visit=VISIT.search(visit_text)
+        chrome=False
+        if visit or sid in {'landinglove','darkdesign'}:
+            chrome = a.find_parent(['footer','nav','aside']) or a.find_parent(class_=CHROME)
+        if visit and not chrome:
             add(full, '', 'visit_or_preview_link')
         if sid == 'csswinner' and detail and 'cover' in a.get('class', []):
             add(full, '', 'detail_cover')

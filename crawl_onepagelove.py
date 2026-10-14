@@ -12,6 +12,7 @@ import csv
 import hashlib
 import html
 import ipaddress
+import io
 import json
 import mimetypes
 import os
@@ -24,6 +25,7 @@ import urllib.robotparser
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -78,7 +80,45 @@ class Robots:
         self.rules, self.locks, self.last = {}, {}, {}
         self.backoff_origins = set()
         self.requests = asyncio.Semaphore(connections)
+        self.process_pool = None
+        self.io_pool = None
         (out / 'robots').mkdir(exist_ok=True)
+
+    async def process(self, function, *args):
+        if self.process_pool is None:
+            return function(*args)
+        await self.process_slots.acquire()
+        try:
+            future=asyncio.get_running_loop().run_in_executor(self.process_pool,function,*args)
+        except BaseException:
+            self.process_slots.release()
+            raise
+        try:
+            return await asyncio.shield(future)
+        finally:
+            if future.done():
+                self.process_slots.release()
+            else:
+                # Cancellation must not grow an unbounded executor backlog.
+                future.add_done_callback(lambda _: self.process_slots.release())
+
+    async def io(self, function, *args, _cancel_event=None, **kwargs):
+        if self.io_pool is None:
+            return function(*args,**kwargs)
+        future=asyncio.get_running_loop().run_in_executor(self.io_pool,partial(function,*args,**kwargs))
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # Finish the operation before cleanup removes/renames its file.
+            if _cancel_event is not None:
+                _cancel_event.set()
+            try:
+                result=await future
+                if isinstance(result,io.IOBase):
+                    result.close()
+            except Exception:
+                pass
+            raise
 
     async def rule(self, url):
         p = urlsplit(url)
@@ -92,7 +132,7 @@ class Robots:
             # Only reuse recently confirmed rules, never failed/denied fetches.
             if report_path.exists():
                 try:
-                    cached = json.loads(report_path.read_text(encoding='utf-8'))
+                    cached = json.loads(await self.io(report_path.read_text,encoding='utf-8'))
                     age = (datetime.now(timezone.utc) - datetime.fromisoformat(cached['checked_at'])).total_seconds()
                     if cached.get('origin') == origin and 0 <= age < 3600 and not cached.get('error'):
                         if cached.get('status') == 200 and isinstance(cached.get('text'), str):
@@ -142,7 +182,7 @@ class Robots:
                         continue
                     parser.disallow_all = True
                     result['error'] = str(e)[:500] or type(e).__name__
-            atomic_json(report_path, result)
+            await self.io(atomic_json,report_path, result)
             self.rules[origin] = parser
             return parser
 
@@ -188,8 +228,11 @@ class Robots:
                 if int(r.headers.get('content-length', '0') or 0) > max_bytes:
                     raise FetchError('file_budget: ' + url)
                 chunks, size = [], 0
-                handle = destination.open('wb') if destination else None
+                handle = None
+                failed = True
                 try:
+                    if destination:
+                        handle = await self.io(destination.open,'wb')
                     async for chunk in r.content.iter_chunked(65536):
                         size += len(chunk)
                         if size > max_bytes:
@@ -199,17 +242,15 @@ class Robots:
                                 raise FetchError('site_budget: ' + url)
                             budget['bytes'] += len(chunk)
                         if handle:
-                            handle.write(chunk)
+                            await self.io(handle.write,chunk)
                         else:
                             chunks.append(chunk)
-                except BaseException:
-                    if handle:
-                        handle.close()
-                        destination.unlink(missing_ok=True)
-                    raise
+                    failed = False
                 finally:
                     if handle:
-                        handle.close()
+                        await self.io(handle.close)
+                    if destination and failed:
+                        await self.io(destination.unlink,missing_ok=True)
                 return {'url': requested, 'final_url': str(r.url), 'mime': r.headers.get('content-type', ''),
                         'charset': r.charset or 'utf-8', 'status': r.status, 'bytes': size,
                         'body': b''.join(chunks) if not destination else None}
@@ -513,11 +554,35 @@ def js_references(text):
             yield value
 
 
+def analyze_page(raw, base):
+    soup=BeautifulSoup(raw,'html.parser')
+    return {'title':soup.title.get_text(' ',strip=True) if soup.title else '',
+            'text':soup.get_text(' ',strip=True),'references':list(html_references(soup,base))}
+
+
+def analyze_asset(path, mime, charset, final_url, depth):
+    path=Path(path)
+    digest=hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda:handle.read(65536),b''):
+            digest.update(chunk)
+    ext=path.suffix
+    if 'css' in mime or ext=='.css':
+        refs=list(css_references(path.read_text(encoding=charset,errors='replace')))
+    elif 'javascript' in mime or ext in {'.js','.mjs'}:
+        refs=list(js_references(path.read_text(encoding=charset,errors='replace')))
+    elif 'html' in mime and depth<2:
+        refs=list(html_references(BeautifulSoup(path.read_bytes(),'html.parser'),final_url))
+    else:
+        refs=[]
+    return digest.hexdigest(),refs
+
+
 async def capture(record, robots, out, args):
     started = time.monotonic()
     slug = re.sub(r'[^a-zA-Z0-9._-]+', '-', urlsplit(record['url']).path.strip('/'))[:90] or 'site'
     folder = out / 'sites' / (slug + '-' + hashlib.sha256(record['url'].encode()).hexdigest()[:8])
-    (folder / 'assets').mkdir(parents=True, exist_ok=True)
+    await robots.io((folder / 'assets').mkdir,parents=True, exist_ok=True)
     meta = dict(record, captured_at=now(), code_kind='published_frontend', mode='http_only',
                 original_project_source=False, rendered=False, screenshots=False,
                 resources=[], blocked=[], errors=[], limitations=[
@@ -554,11 +619,11 @@ async def capture(record, robots, out, args):
             return meta, folder
         page = await robots.fetch(target, max_bytes=4 * 1024**2, budget=budget)
         meta['final_url'], meta['http_status'] = page['final_url'], page['status']
-        (folder / 'source.html').write_bytes(page['body'])
-        soup = BeautifulSoup(page['body'], 'html.parser')
-        meta['page_title'] = soup.title.get_text(' ', strip=True) if soup.title else ''
-        text = soup.get_text(' ', strip=True)
-        (folder / 'page_text.txt').write_text(text, encoding='utf-8')
+        await robots.io((folder / 'source.html').write_bytes,page['body'])
+        analysis = await robots.process(analyze_page,page['body'],page['final_url'])
+        meta['page_title'] = analysis['title']
+        text = analysis['text']
+        await robots.io((folder / 'page_text.txt').write_text,text, encoding='utf-8')
         if any(value in (meta['page_title'] + '\n' + text[:2000]).lower() for value in (
                 'just a moment', 'verify you are human', 'checking your browser', 'domain is for sale', 'buy this domain')):
             meta['status'] = 'blocked_or_parked'
@@ -585,7 +650,7 @@ async def capture(record, robots, out, args):
                 return
             queue.put_nowait((full, depth))
 
-        for ref in html_references(soup, base):
+        for ref in analysis['references']:
             enqueue(ref)
 
         async def asset_worker():
@@ -603,26 +668,11 @@ async def capture(record, robots, out, args):
                     if 'javascript' in mime:
                         ext = '.js'
                     path = temp.with_suffix(ext)
-                    temp.replace(path)
-                    # Hash in bounded chunks; never hold multiple large binary assets in RAM.
-                    digest = hashlib.sha256()
-                    with path.open('rb') as handle:
-                        for chunk in iter(lambda: handle.read(65536), b''):
-                            digest.update(chunk)
+                    await robots.io(temp.replace,path)
+                    digest,refs = await robots.process(analyze_asset,str(path),mime,result['charset'],result['final_url'],depth)
                     resource = {k: result[k] for k in ('url', 'final_url', 'status', 'mime', 'bytes')}
-                    resource.update(file=path.relative_to(folder).as_posix(), sha256=digest.hexdigest())
+                    resource.update(file=path.relative_to(folder).as_posix(), sha256=digest)
                     meta['resources'].append(resource)
-                    asset_text = None
-                    if 'css' in mime or ext == '.css':
-                        asset_text = path.read_text(encoding=result['charset'], errors='replace')
-                        refs = css_references(asset_text)
-                    elif 'javascript' in mime or ext in {'.js', '.mjs'}:
-                        asset_text = path.read_text(encoding=result['charset'], errors='replace')
-                        refs = js_references(asset_text)
-                    elif 'html' in mime and depth < 2:
-                        refs = html_references(BeautifulSoup(path.read_bytes(), 'html.parser'), result['final_url'])
-                    else:
-                        refs = ()
                     for ref in refs:
                         enqueue(urljoin(result['final_url'], ref), depth + 1)
                 except Exception as e:
@@ -632,7 +682,7 @@ async def capture(record, robots, out, args):
                     else:
                         meta['errors'].append({'url': url, 'error': message[:400]})
                 finally:
-                    temp.unlink(missing_ok=True)
+                    await robots.io(temp.unlink,missing_ok=True)
                     queue.task_done()
 
         tasks = [asyncio.create_task(asset_worker()) for _ in range(args.asset_workers)]
@@ -655,7 +705,7 @@ async def capture(record, robots, out, args):
         meta['bytes_received'] = budget['bytes']
         meta['resource_count'] = len(meta['resources'])
         meta['elapsed_seconds'] = round(time.monotonic() - started, 3)
-        atomic_json(folder / 'metadata.json', meta)
+        await robots.io(atomic_json,folder / 'metadata.json', meta)
     return meta, folder
 
 
