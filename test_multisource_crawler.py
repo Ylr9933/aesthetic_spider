@@ -83,6 +83,23 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
                                       self.archive,None,SimpleNamespace(max_repo_bytes=1024**2))
         self.assertFalse((self.out/'outside.html').exists())
 
+    async def test_legacy_gallery_redirect_indexes_real_landing_url(self):
+        self.archive.sources['onepagelove']={'id':'onepagelove','url':'https://onepagelove.com/','kind':'gallery'}
+        self.archive.gallery_hosts.add('onepagelove.com')
+        folder=self.out/'old-site'
+        folder.mkdir()
+        (folder/'source.html').write_text('<title>Actual target</title>',encoding='utf-8')
+        (folder/'metadata.json').write_text(json.dumps({'final_url':'https://actual.example/'}),encoding='utf-8')
+        self.archive.add_site('onepagelove',{'target':'https://onepagelove.com/go/example','title':'Example',
+            'entry_url':'https://onepagelove.com/example','evidence':'legacy'},folder,'downloaded')
+        self.assertEqual(self.archive.db.execute('SELECT target,final_url FROM sites').fetchall(),
+                         [('https://actual.example/','https://actual.example/')])
+        self.archive.add_site('onepagelove',{'target':'https://onepagelove.com/go/unresolved','title':'Other',
+            'entry_url':'https://onepagelove.com/other','evidence':'legacy'})
+        self.assertEqual(self.archive.db.execute('SELECT COUNT(*) FROM sites').fetchone()[0],1)
+        self.assertEqual(self.archive.db.execute("SELECT url FROM jobs WHERE kind='resolve'").fetchone()[0],
+                         'https://onepagelove.com/go/unresolved')
+
     async def test_stop_cancels_blocked_http_and_preserves_queue(self):
         root=self.out/'pause-test'
         root.mkdir()

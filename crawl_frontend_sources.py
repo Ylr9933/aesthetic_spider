@@ -27,7 +27,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from crawl_onepagelove import AGENT, Robots, FetchError, capture, now, normalized, atomic_json
-from source_adapters import extract, extract_payload, host, directory_url, repository_url, is_detail
+from source_adapters import extract, extract_payload, host, directory_url, repository_url, is_detail, target_url
 
 SUCCESS = {'downloaded','downloaded_partial','captured','captured_partial','code_saved','repository_saved'}
 
@@ -39,6 +39,7 @@ def key(url):
 class Archive:
     def __init__(self, out, sources):
         self.out, self.sources = out, {s['id']: s for s in sources}
+        self.gallery_hosts={host(s['url']) for s in sources}
         self.db = sqlite3.connect(out / 'state.sqlite')
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.executescript('''
@@ -72,6 +73,15 @@ class Archive:
 
     def add_site(self, source, record, existing_folder=None, existing_status=None):
         target = normalized(record['target'])
+        existing_meta={}
+        if existing_folder and (Path(existing_folder)/'metadata.json').exists():
+            existing_meta=json.loads((Path(existing_folder)/'metadata.json').read_text(encoding='utf-8'))
+            if existing_meta.get('final_url'):
+                target=normalized(existing_meta['final_url'])
+        if host(target) in self.gallery_hosts and not (source=='codrops' and re.match(r'^/(?:Tutorials|Development)/',urlsplit(target).path)):
+            if source=='onepagelove' and urlsplit(target).path.startswith('/go/'):
+                self.add_job('resolve',source,target,title=record['title'])
+            return
         self.db.execute('INSERT OR IGNORE INTO sites(target,source,title,updated) VALUES(?,?,?,?)',
                         (target,source,record['title'],now()))
         self.db.execute('INSERT OR REPLACE INTO provenance VALUES(?,?,?,?)',
@@ -79,8 +89,8 @@ class Archive:
         if not self.db.execute("SELECT 1 FROM jobs WHERE kind='site' AND url=? LIMIT 1",(target,)).fetchone():
             self.add_job('site',source,target,title=record['title'])
         if existing_folder and existing_status in SUCCESS and (Path(existing_folder)/'source.html').exists():
-            self.db.execute('UPDATE sites SET status=?,folder=?,updated=? WHERE target=?',
-                            (existing_status,str(Path(existing_folder).resolve()),now(),target))
+            self.db.execute('UPDATE sites SET status=?,folder=?,final_url=?,updated=? WHERE target=?',
+                            (existing_status,str(Path(existing_folder).resolve()),existing_meta.get('final_url'),now(),target))
             self.db.execute("UPDATE jobs SET status=?,folder=? WHERE kind='site' AND url=?",
                             (existing_status,str(Path(existing_folder).resolve()),target))
 
@@ -225,6 +235,20 @@ def import_onepagelove(archive, root):
     return count
 
 
+def repair_legacy_gallery_targets(archive):
+    """Remove directory aliases from the target index, retaining their saved files."""
+    for target,source,title,status,folder in list(archive.db.execute('SELECT target,source,title,status,folder FROM sites')):
+        if host(target) not in archive.gallery_hosts or source=='codrops' and re.match(r'^/(?:Tutorials|Development)/',urlsplit(target).path):
+            continue
+        refs=list(archive.db.execute('SELECT source,entry_url,evidence FROM provenance WHERE target=?',(target,)))
+        for sid,entry,evidence in refs:
+            archive.add_site(sid,{'target':target,'title':title,'entry_url':entry,'evidence':evidence},folder,status)
+        archive.db.execute('DELETE FROM provenance WHERE target=?',(target,))
+        archive.db.execute("DELETE FROM jobs WHERE kind='site' AND url=?",(target,))
+        archive.db.execute('DELETE FROM sites WHERE target=?',(target,))
+    archive.db.commit()
+
+
 async def discover(job, archive, robots, args, gallery_hosts):
     source = archive.sources[job['source']]
     response = await robots.fetch(job['url'],max_bytes=12*1024**2,minimum=args.directory_delay,timeout=40)
@@ -245,7 +269,6 @@ async def discover(job, archive, robots, args, gallery_hosts):
                 if not isinstance(case,dict):
                     continue
                 if case.get('url'):
-                    from source_adapters import target_url
                     if target_url(source,case['url'],gallery_hosts):
                         archive.add_site(source['id'],{'target':case['url'],'title':case.get('title') or case.get('slug') or case['url'],
                             'entry_url':urljoin(source['url'],'/cases/'+case['slug']) if case.get('slug') else final,
@@ -340,6 +363,17 @@ async def download_site(job, archive, robots, args, gallery_hosts):
     return meta['status'],folder,meta
 
 
+async def resolve_redirect(job,archive,robots,args,gallery_hosts):
+    response=await robots.fetch(job['url'],max_bytes=4*1024**2,minimum=args.directory_delay,timeout=40)
+    final=normalized(response['final_url'])
+    if host(final) in gallery_hosts:
+        return 'no_public_target',None,{'error':'redirect_did_not_reach_external_site','final_url':final}
+    archive.add_site(job['source'],{'target':final,'title':job['title'],
+                                  'entry_url':job['url'],'evidence':'resolved_gallery_redirect'})
+    archive.db.commit()
+    return 'discovered',None,{'final_url':final}
+
+
 async def download_repo(job, archive, robots, args):
     parts = urlsplit(job['url']).path.strip('/').split('/')[:2]
     folder = archive.out/'repositories'/(parts[0]+'--'+parts[1])
@@ -426,6 +460,7 @@ async def main(args):
             for repo in source.get('repositories',[]):
                 archive.add_repo(source['id'],'https://github.com/'+repo)
         reused=import_onepagelove(archive,Path(args.opl_archive).resolve())
+        repair_legacy_gallery_targets(archive)
         if args.retry_failed:
             archive.db.execute("UPDATE jobs SET status='pending',error=NULL WHERE status IN ('failed','http_failed','robots_skipped','discovery_failed')")
         archive.db.commit()
@@ -454,6 +489,9 @@ async def main(args):
                                 status,folder,result=await discover(job,archive,robots,args,gallery_hosts)
                         elif kind=='site':
                             status,folder,result=await download_site(job,archive,robots,args,gallery_hosts)
+                        elif kind=='resolve':
+                            async with asyncio.timeout(70):
+                                status,folder,result=await resolve_redirect(job,archive,robots,args,gallery_hosts)
                         else:
                             async with asyncio.timeout(600):
                                 status,folder,result=await download_repo(job,archive,robots,args)
@@ -490,6 +528,7 @@ async def main(args):
                     eligible=any(archive.has_eligible(k,args.discovery_limit) for k in ('discovery','sitemap','payload'))
                     eligible=eligible or (not args.site_limit or claimed['site']<args.site_limit) and archive.has_eligible('site')
                     eligible=eligible or (not args.repo_limit or claimed['repo']<args.repo_limit) and archive.has_eligible('repo')
+                    eligible=eligible or archive.has_eligible('resolve')
                     idle=idle+1 if not running and not eligible else 0
                     if idle>=4:
                         archive.phase='sample_complete' if args.discovery_limit or args.site_limit or args.repo_limit else 'frontier_exhausted'
@@ -507,6 +546,7 @@ async def main(args):
             jobs=[asyncio.create_task(worker('discovery')) for _ in range(args.discovery_workers)]
             jobs += [asyncio.create_task(worker('sitemap')) for _ in range(4)]
             jobs += [asyncio.create_task(worker('payload')) for _ in range(4)]
+            jobs += [asyncio.create_task(worker('resolve')) for _ in range(2)]
             jobs += [asyncio.create_task(worker('site')) for _ in range(args.workers)]
             jobs += [asyncio.create_task(worker('repo')) for _ in range(args.repo_workers)]
             jobs += [asyncio.create_task(control()),asyncio.create_task(reporter())]
