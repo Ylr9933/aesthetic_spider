@@ -14,6 +14,21 @@ import crawl_onepagelove as crawler
 
 
 class HttpArchiveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_valid_robots_cache_avoids_second_http_request(self):
+        await self.robots.rule(self.base+'/first')
+        before=len(self.paths)
+        again=crawler.Robots(self.session,self.out,connections=2)
+        self.assertTrue(await again.allowed(self.base+'/second'))
+        self.assertFalse(await again.allowed(self.base+'/private/example'))
+        self.assertEqual(len(self.paths),before)
+
+    async def test_failed_robots_cache_is_rechecked(self):
+        import hashlib
+        report=self.out/'robots'/(hashlib.sha256(self.base.encode()).hexdigest()[:20]+'.json')
+        crawler.atomic_json(report,{'origin':self.base,'checked_at':crawler.now(),'status':403,'error':'failed'})
+        self.assertTrue(await self.robots.allowed(self.base+'/public'))
+        self.assertIn('/robots.txt',self.paths)
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.out = Path(self.temp.name)

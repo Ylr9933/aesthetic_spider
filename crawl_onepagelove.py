@@ -88,41 +88,61 @@ class Robots:
             if origin in self.rules:
                 return self.rules[origin]
             parser = urllib.robotparser.RobotFileParser(origin + '/robots.txt')
-            result = {'origin': origin, 'checked_at': now()}
-            try:
-                robots_url = origin + '/robots.txt'
-                for hop in range(5):
-                    async with self.requests, self.session.get(robots_url, allow_redirects=False,
-                                            timeout=aiohttp.ClientTimeout(total=15)) as redirect_response:
-                        if redirect_response.status in {301, 302, 303, 307, 308}:
-                            robots_url = urljoin(robots_url, redirect_response.headers['Location'])
-                            if not public_url(robots_url):
-                                raise FetchError('non_public_robots_redirect')
-                            continue
-                        # Parse the final response in this context instead of requesting twice.
-                        result['status'] = redirect_response.status
-                        if redirect_response.status == 200:
-                            chunks, size = [], 0
-                            async for chunk in redirect_response.content.iter_chunked(65536):
-                                size += len(chunk)
-                                if size > 512 * 1024:
-                                    raise FetchError('robots response too large')
-                                chunks.append(chunk)
-                            result['text'] = b''.join(chunks).decode('utf-8', 'replace')
-                            parser.parse(result['text'].splitlines())
-                        elif redirect_response.status in {404, 410}:
+            report_path = self.out / 'robots' / (hashlib.sha256(origin.encode()).hexdigest()[:20] + '.json')
+            # Only reuse recently confirmed rules, never failed/denied fetches.
+            if report_path.exists():
+                try:
+                    cached = json.loads(report_path.read_text(encoding='utf-8'))
+                    age = (datetime.now(timezone.utc) - datetime.fromisoformat(cached['checked_at'])).total_seconds()
+                    if cached.get('origin') == origin and 0 <= age < 3600 and not cached.get('error'):
+                        if cached.get('status') == 200 and isinstance(cached.get('text'), str):
+                            parser.parse(cached['text'].splitlines())
+                            self.rules[origin] = parser
+                            return parser
+                        if cached.get('status') in {404, 410}:
                             parser.parse([])
-                        else:
-                            parser.disallow_all = True
-                            result['error'] = 'robots unavailable; skipped conservatively'
-                        break
-                else:
-                    raise FetchError('too many robots redirects')
-
-            except Exception as e:
-                parser.disallow_all = True
-                result['error'] = str(e)[:500]
-            atomic_json(self.out / 'robots' / (hashlib.sha256(origin.encode()).hexdigest()[:20] + '.json'), result)
+                            self.rules[origin] = parser
+                            return parser
+                except (ValueError, KeyError, TypeError, OSError):
+                    pass
+            result = {'origin': origin, 'checked_at': now()}
+            for attempt in range(2):
+                try:
+                    robots_url = origin + '/robots.txt'
+                    for hop in range(5):
+                        async with self.requests, self.session.get(robots_url, allow_redirects=False,
+                                                timeout=aiohttp.ClientTimeout(total=15)) as redirect_response:
+                            if redirect_response.status in {301, 302, 303, 307, 308}:
+                                robots_url = urljoin(robots_url, redirect_response.headers['Location'])
+                                if not public_url(robots_url):
+                                    raise FetchError('non_public_robots_redirect')
+                                continue
+                            result['status'] = redirect_response.status
+                            if redirect_response.status == 200:
+                                chunks, size = [], 0
+                                async for chunk in redirect_response.content.iter_chunked(65536):
+                                    size += len(chunk)
+                                    if size > 512 * 1024:
+                                        raise FetchError('robots response too large')
+                                    chunks.append(chunk)
+                                result['text'] = b''.join(chunks).decode('utf-8', 'replace')
+                                parser.parse(result['text'].splitlines())
+                            elif redirect_response.status in {404, 410}:
+                                parser.parse([])
+                            else:
+                                parser.disallow_all = True
+                                result['error'] = 'robots unavailable; skipped conservatively'
+                            break
+                    else:
+                        raise FetchError('too many robots redirects')
+                    break
+                except Exception as e:
+                    if attempt == 0 and isinstance(e, (aiohttp.ClientError, TimeoutError)):
+                        await asyncio.sleep(.5)
+                        continue
+                    parser.disallow_all = True
+                    result['error'] = str(e)[:500] or type(e).__name__
+            atomic_json(report_path, result)
             self.rules[origin] = parser
             return parser
 
@@ -145,7 +165,7 @@ class Robots:
             await asyncio.sleep(max(0, self.last.get(origin, 0) + delay - time.monotonic()))
             self.last[origin] = time.monotonic()
 
-    async def fetch(self, url, max_bytes=LIMIT_FILE, minimum=.06, destination=None, budget=None):
+    async def fetch(self, url, max_bytes=LIMIT_FILE, minimum=.06, destination=None, budget=None, timeout=25):
         requested = url
         for hop in range(8):
             if budget is not None and budget['bytes'] >= LIMIT_SITE:
@@ -155,7 +175,7 @@ class Robots:
             # All directory, detail and resource requests share the same origin limits.
             await self.pace(url, max(minimum, .8) if urlsplit(url).hostname == 'onepagelove.com' else minimum)
             async with self.requests, self.session.get(url, allow_redirects=False,
-                                        timeout=aiohttp.ClientTimeout(total=25, connect=10)) as r:
+                                        timeout=aiohttp.ClientTimeout(total=timeout, connect=10)) as r:
                 if r.status in {301, 302, 303, 307, 308}:
                     url = urljoin(url, r.headers['Location'])
                     continue
