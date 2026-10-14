@@ -1,6 +1,7 @@
 """Resumable One Page Love directory + published frontend archive.
 
 Captures public landing pages and delivered assets, not original app source.
+HTTP only: no browser, rendering, JavaScript execution, or screenshots.
 No logins, purchases, form submissions, or anti-bot circumvention.
 """
 from __future__ import annotations
@@ -28,7 +29,6 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 
 ROOT = 'https://onepagelove.com'
 AGENT = 'FrontendArchive/1.0'
@@ -66,11 +66,18 @@ def atomic_json(path, value):
     tmp.replace(path)
 
 
+class FetchError(RuntimeError):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
 class Robots:
-    def __init__(self, session, out):
+    def __init__(self, session, out, connections=384):
         self.session, self.out = session, out
         self.rules, self.locks, self.last = {}, {}, {}
         self.backoff_origins = set()
+        self.requests = asyncio.Semaphore(connections)
         (out / 'robots').mkdir(exist_ok=True)
 
     async def rule(self, url):
@@ -83,20 +90,35 @@ class Robots:
             parser = urllib.robotparser.RobotFileParser(origin + '/robots.txt')
             result = {'origin': origin, 'checked_at': now()}
             try:
-                async with self.session.get(origin + '/robots.txt', allow_redirects=True,
-                                            timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    result['status'] = r.status
-                    if r.status == 200:
-                        raw = await r.read()
-                        if len(raw) > 512 * 1024:
-                            raise RuntimeError('robots response too large')
-                        result['text'] = raw.decode('utf-8', 'replace')
-                        parser.parse(result['text'].splitlines())
-                    elif r.status in {404, 410}:
-                        parser.parse([])
-                    else:
-                        parser.disallow_all = True
-                        result['error'] = 'robots unavailable; skipped conservatively'
+                robots_url = origin + '/robots.txt'
+                for hop in range(5):
+                    async with self.requests, self.session.get(robots_url, allow_redirects=False,
+                                            timeout=aiohttp.ClientTimeout(total=15)) as redirect_response:
+                        if redirect_response.status in {301, 302, 303, 307, 308}:
+                            robots_url = urljoin(robots_url, redirect_response.headers['Location'])
+                            if not public_url(robots_url):
+                                raise FetchError('non_public_robots_redirect')
+                            continue
+                        # Parse the final response in this context instead of requesting twice.
+                        result['status'] = redirect_response.status
+                        if redirect_response.status == 200:
+                            chunks, size = [], 0
+                            async for chunk in redirect_response.content.iter_chunked(65536):
+                                size += len(chunk)
+                                if size > 512 * 1024:
+                                    raise FetchError('robots response too large')
+                                chunks.append(chunk)
+                            result['text'] = b''.join(chunks).decode('utf-8', 'replace')
+                            parser.parse(result['text'].splitlines())
+                        elif redirect_response.status in {404, 410}:
+                            parser.parse([])
+                        else:
+                            parser.disallow_all = True
+                            result['error'] = 'robots unavailable; skipped conservatively'
+                        break
+                else:
+                    raise FetchError('too many robots redirects')
+
             except Exception as e:
                 parser.disallow_all = True
                 result['error'] = str(e)[:500]
@@ -123,30 +145,58 @@ class Robots:
             await asyncio.sleep(max(0, self.last.get(origin, 0) + delay - time.monotonic()))
             self.last[origin] = time.monotonic()
 
-    async def get(self, url, max_bytes=4 * 1024 * 1024, minimum=.8):
+    async def fetch(self, url, max_bytes=LIMIT_FILE, minimum=.06, destination=None, budget=None):
+        requested = url
         for hop in range(8):
+            if budget is not None and budget['bytes'] >= LIMIT_SITE:
+                raise FetchError('site_budget: ' + url)
             if not await self.allowed(url):
-                raise RuntimeError('robots_disallowed_or_unavailable: ' + url)
-            await self.pace(url, minimum)
-            async with self.session.get(url, allow_redirects=False,
-                                        timeout=aiohttp.ClientTimeout(total=30)) as r:
+                raise FetchError('robots_disallowed_or_unavailable: ' + url)
+            # All directory, detail and resource requests share the same origin limits.
+            await self.pace(url, max(minimum, .8) if urlsplit(url).hostname == 'onepagelove.com' else minimum)
+            async with self.requests, self.session.get(url, allow_redirects=False,
+                                        timeout=aiohttp.ClientTimeout(total=25, connect=10)) as r:
                 if r.status in {301, 302, 303, 307, 308}:
                     url = urljoin(url, r.headers['Location'])
                     continue
                 if r.status in {429, 503}:
                     p = urlsplit(url)
                     self.backoff_origins.add(f'{p.scheme}://{p.netloc}')
-                    raise RuntimeError(f'origin_backoff_required: HTTP {r.status}: {url}')
-                r.raise_for_status()
+                    raise FetchError(f'origin_backoff_required: HTTP {r.status}: {url}', r.status)
+                if r.status >= 400:
+                    raise FetchError(f'HTTP {r.status}: {url}', r.status)
+                if int(r.headers.get('content-length', '0') or 0) > max_bytes:
+                    raise FetchError('file_budget: ' + url)
                 chunks, size = [], 0
-                async for chunk in r.content.iter_chunked(65536):
-                    size += len(chunk)
-                    if size > max_bytes:
-                        raise RuntimeError('response too large: ' + url)
-                    chunks.append(chunk)
-                raw = b''.join(chunks)
-                return raw
-        raise RuntimeError('too many redirects')
+                handle = destination.open('wb') if destination else None
+                try:
+                    async for chunk in r.content.iter_chunked(65536):
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise FetchError('file_budget: ' + url)
+                        if budget is not None:
+                            if budget['bytes'] + len(chunk) > LIMIT_SITE:
+                                raise FetchError('site_budget: ' + url)
+                            budget['bytes'] += len(chunk)
+                        if handle:
+                            handle.write(chunk)
+                        else:
+                            chunks.append(chunk)
+                except BaseException:
+                    if handle:
+                        handle.close()
+                        destination.unlink(missing_ok=True)
+                    raise
+                finally:
+                    if handle:
+                        handle.close()
+                return {'url': requested, 'final_url': str(r.url), 'mime': r.headers.get('content-type', ''),
+                        'charset': r.charset or 'utf-8', 'status': r.status, 'bytes': size,
+                        'body': b''.join(chunks) if not destination else None}
+        raise FetchError('too many redirects: ' + requested)
+
+    async def get(self, url, max_bytes=4 * 1024 * 1024, minimum=.8):
+        return (await self.fetch(url, max_bytes, minimum))['body']
 
 
 class Store:
@@ -172,6 +222,14 @@ class Store:
         return row[0] if row else None
 
     def put(self, record, commit=True):
+        # A directory page may be discovered while this record is being downloaded.
+        old = self.db.execute('SELECT data FROM entries WHERE url=?', (record['url'],)).fetchone()
+        if old:
+            previous = json.loads(old[0])
+            record = {**previous, **record, 'target': record.get('target') or previous.get('target')}
+        if record.get('target'):
+            self.db.execute("UPDATE entries SET status='pending',error=NULL WHERE url=? AND status='no_public_target'",
+                            (record['url'],))
         self.db.execute('''INSERT INTO entries(url,title,target,data,updated) VALUES (?,?,?,?,?)
           ON CONFLICT(url) DO UPDATE SET title=excluded.title,
           target=excluded.target,data=excluded.data,updated=excluded.updated''',
@@ -185,7 +243,7 @@ class Store:
         self.db.commit()
 
     def pending(self):
-        row = self.db.execute("SELECT data FROM entries WHERE status='pending' ORDER BY rowid LIMIT 1").fetchone()
+        row = self.db.execute("SELECT data FROM entries WHERE status='pending' ORDER BY (target IS NULL OR target=''),rowid LIMIT 1").fetchone()
         return json.loads(row[0]) if row else None
 
     def export(self):
@@ -195,6 +253,10 @@ class Store:
                   'last_catalog_page': self.setting('last_catalog_page'),
                   'catalog_complete': self.setting('catalog_complete') == '1',
                   'sitemap_candidate_count': self.setting('sitemap_candidate_count'),
+                  'mode': 'http_only', 'browser': False, 'screenshots': False,
+                  'workers': self.setting('workers'), 'connections': self.setting('connections'),
+                  'asset_workers_per_site': self.setting('asset_workers'),
+                  'completed_this_run': getattr(self, 'completed', 0),
                   'scope': 'Public listed landing pages and delivered frontend assets; not original project source',
                   'stop': 'Create STOP file in this output directory to stop gracefully'}
         atomic_json(self.out / 'progress.json', report)
@@ -210,12 +272,23 @@ class Store:
             writer.writerow(['opl_url', 'title', 'target_url', 'status', 'folder', 'error'])
             writer.writerows(rows)
         cards = []
+        manifest = []
         for url, title, target, status, folder, error in rows:
-            if folder and (self.out / folder / 'desktop.png').exists():
+            if folder and (self.out / folder / 'source.html').exists():
+                if status in {'captured', 'captured_partial', 'downloaded', 'downloaded_partial'}:
+                    manifest.append([title, target, status, str((self.out / folder / 'source.html').resolve()),
+                                     str((self.out / folder / 'assets').resolve()),
+                                     str((self.out / folder / 'metadata.json').resolve()), url])
                 rel = html.escape(folder.replace('\\', '/'), quote=True)
-                cards.append(f'<article><a href="{rel}/offline.html"><img loading="lazy" src="{rel}/desktop.png">'
+                thumbnail = f'<img loading="lazy" src="{rel}/desktop.png">' if (self.out / folder / 'desktop.png').exists() else ''
+                preview = 'offline.html' if (self.out / folder / 'offline.html').exists() else 'source.html'
+                cards.append(f'<article><a href="{rel}/{preview}">{thumbnail}'
                              f'<h3>{html.escape(title)}</h3></a><p>{html.escape(status)}</p>'
                              f'<a href="{rel}/metadata.json">Metadata</a></article>')
+        with (self.out / 'sites_manifest.csv').open('w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['title', 'target_url', 'status', 'local_html', 'local_assets', 'metadata', 'opl_entry_url'])
+            writer.writerows(manifest)
         (self.out / 'index.html').write_text(
             '<!doctype html><meta charset="utf-8"><title>One Page Love archive</title>'
             '<style>body{font:16px system-ui;margin:32px;background:#f4f4f4}section{display:grid;'
@@ -365,162 +438,203 @@ def offline_preview(folder, raw_dom, base_url, resources):
     (folder / 'offline.html').write_text(str(soup), encoding='utf-8')
 
 
-async def capture(browser, record, robots, out):
+CSS_URL = re.compile(r'''url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*?))\s*\)''', re.I)
+CSS_IMPORT = re.compile(r'''@import\s+["']([^"']+)["']''', re.I)
+JS_IMPORT = re.compile(r'''(?:\b(?:import|export)\s+(?:[^;\n]*?\s+from\s*)?|\bimport\s*\(\s*)["']([^"']+)["']''')
+JS_URL = re.compile(r'''new\s+URL\(\s*["']([^"']+)["']\s*,\s*import\.meta\.url''')
+MEDIA_EXT = {'.mp4', '.webm', '.mp3', '.m3u8', '.ogg', '.wav', '.mov', '.avi'}
+
+
+def css_references(text):
+    # Remove comments first; preserve original downloaded bytes separately.
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+    yield from CSS_IMPORT.findall(text)
+    for match in CSS_URL.finditer(text):
+        yield next((part for part in match.groups() if part is not None), '').strip()
+
+
+def html_references(soup, base):
+    base_tag = soup.find('base', href=True)
+    if base_tag:
+        base = urljoin(base, base_tag['href'])
+    for tag in soup.find_all(True):
+        if tag.name in {'script', 'img', 'source', 'input', 'iframe', 'audio', 'video'}:
+            for attribute in ('src', 'data-src', 'data-lazy-src', 'data-original', 'poster'):
+                if tag.get(attribute):
+                    if tag.name in {'audio', 'video', 'source'} and attribute == 'src' and (
+                            tag.name != 'source' or tag.get('type', '').startswith(('audio/', 'video/'))):
+                        continue
+                    yield urljoin(base, tag[attribute])
+            for attribute in ('srcset', 'data-srcset'):
+                for part in tag.get(attribute, '').split(','):
+                    candidate = part.strip().split()
+                    if candidate and not candidate[0].startswith('data:'):
+                        yield urljoin(base, candidate[0])
+        if tag.name == 'link' and tag.get('href'):
+            rel = set(tag.get('rel', []))
+            if rel & {'stylesheet', 'icon', 'apple-touch-icon', 'preload', 'modulepreload', 'manifest'}:
+                if tag.get('as') not in {'video', 'audio'}:
+                    yield urljoin(base, tag['href'])
+        if tag.get('style'):
+            for value in css_references(tag['style']):
+                yield urljoin(base, value)
+        if tag.name == 'style':
+            for value in css_references(tag.get_text()):
+                yield urljoin(base, value)
+        if tag.name == 'script' and not tag.get('src'):
+            for value in js_references(tag.get_text()):
+                yield urljoin(base, value)
+
+
+def js_references(text):
+    for value in list(JS_IMPORT.findall(text)) + list(JS_URL.findall(text)):
+        # Bare package specifiers require a resolver/build pipeline and aren't URLs.
+        if value.startswith(('./', '../', '/', 'https://', 'http://')):
+            yield value
+
+
+async def capture(record, robots, out, args):
+    started = time.monotonic()
     slug = re.sub(r'[^a-zA-Z0-9._-]+', '-', urlsplit(record['url']).path.strip('/'))[:90] or 'site'
     folder = out / 'sites' / (slug + '-' + hashlib.sha256(record['url'].encode()).hexdigest()[:8])
     (folder / 'assets').mkdir(parents=True, exist_ok=True)
-    meta = dict(record, captured_at=now(), code_kind='published_frontend',
-                original_project_source=False, resources=[], blocked=[], errors=[],
-                limitations=['Only the listed landing page is captured.',
-                             'Offline preview is a static DOM snapshot; original delivered JS is saved separately.',
-                             'Media streams, login flows and interactions requiring backend services are not captured.'])
+    meta = dict(record, captured_at=now(), code_kind='published_frontend', mode='http_only',
+                original_project_source=False, rendered=False, screenshots=False,
+                resources=[], blocked=[], errors=[], limitations=[
+                    'Only the listed landing page and statically discoverable referenced assets are downloaded.',
+                    'JavaScript is saved but never executed. Runtime-generated content, fetches and dynamic assets may be missing.',
+                    'No browser, rendering or screenshots. No claim of visual or functional validation.',
+                    'Media streams, logins, backend interactions and original private project source are not captured.',
+                    'JS/CSS reference parsing is best effort; bundler runtime chunk maps and import maps are not fully resolved.'])
+    tasks = []
+    budget = {'bytes': 0}
     target = record.get('target')
-    if not target:
-        detail = await robots.get(record['url'])
-        detail_dir = out / 'directory' / 'details'
-        detail_dir.mkdir(exist_ok=True)
-        (detail_dir / (folder.name + '.html')).write_bytes(detail)
-        soup = BeautifulSoup(detail, 'html.parser')
-        heading = soup.select_one('h1')
-        if heading:
-            meta['title'] = heading.get_text(' ', strip=True)
-        visit = next((a for a in soup.find_all('a', href=True)
-                      if a.get_text(' ', strip=True).startswith('Visit Website')), None)
-        if visit:
+    try:
+        if not target:
+            detail_dir = out / 'directory' / 'details'
+            detail_dir.mkdir(exist_ok=True)
+            detail_path = detail_dir / (folder.name + '.html')
+            # Reuse public detail HTML already saved by previous runs.
+            detail = detail_path.read_bytes() if detail_path.exists() else await robots.get(record['url'])
+            if not detail_path.exists():
+                detail_path.write_bytes(detail)
+            soup = BeautifulSoup(detail, 'html.parser')
+            heading = soup.select_one('h1')
+            if heading:
+                meta['title'] = heading.get_text(' ', strip=True)
+            visit = next((a for a in soup.find_all('a', href=True)
+                          if a.get_text(' ', strip=True).startswith(('Visit Website', 'Launch Website'))), None)
+            if not visit:
+                meta['status'] = 'no_public_target'
+                return meta, folder
             target = normalized(urljoin(record['url'], visit['href']))
             meta['target'] = target
-        else:
-            meta['status'] = 'no_public_target'
-            atomic_json(folder / 'metadata.json', meta)
+        if not await robots.allowed(target):
+            meta['status'] = 'robots_skipped'
             return meta, folder
-    if not await robots.allowed(target):
-        meta['status'] = 'robots_skipped'
-        atomic_json(folder / 'metadata.json', meta)
-        return meta, folder
-
-    context = await browser.new_context(viewport={'width': 1440, 'height': 1000},
-                                        device_scale_factor=1, user_agent=AGENT,
-                                        service_workers='block', accept_downloads=False)
-    total = 0
-    resource_count = 0
-
-    async def route_handler(route):
-        nonlocal total, resource_count
-        request = route.request
-        url = request.url
-        try:
-            if request.method not in {'GET', 'HEAD'}:
-                meta['blocked'].append({'url': url, 'reason': 'non_read_request'})
-                await route.abort()
-                return
-            if request.resource_type in {'media', 'websocket'}:
-                meta['blocked'].append({'url': url, 'reason': 'streaming_media'})
-                await route.abort()
-                return
-            if total >= LIMIT_SITE or resource_count >= 500:
-                meta['blocked'].append({'url': url, 'reason': 'site_budget'})
-                await route.abort()
-                return
-            if not await robots.allowed(url):
-                meta['blocked'].append({'url': url, 'reason': 'robots'})
-                await route.abort()
-                return
-            await robots.pace(url, .06)
-            response = await route.fetch(max_redirects=0, timeout=25000)
-            if response.status in {429, 503}:
-                p = urlsplit(url)
-                robots.backoff_origins.add(f'{p.scheme}://{p.netloc}')
-                meta['blocked'].append({'url': url, 'reason': f'http_{response.status}'})
-                await route.abort()
-                return
-            mime = response.headers.get('content-type', '')
-            if int(response.headers.get('content-length', '0') or 0) > LIMIT_FILE:
-                meta['blocked'].append({'url': url, 'reason': 'file_budget'})
-                await route.abort()
-                return
-            body = await response.body()
-            if len(body) > LIMIT_FILE or total + len(body) > LIMIT_SITE:
-                meta['blocked'].append({'url': url, 'reason': 'file_or_site_budget'})
-                await route.abort()
-                return
-            resource_count += 1
-            total += len(body)
-            resource = {'url': url, 'status': response.status, 'mime': mime,
-                        'type': request.resource_type, 'bytes': len(body)}
-            if response.status == 200 and body:
-                ext = mimetypes.guess_extension(mime.split(';')[0].strip()) or '.bin'
-                if 'javascript' in mime:
-                    ext = '.js'
-                digest = hashlib.sha256(body).hexdigest()
-                resource['file'] = 'assets/' + hashlib.sha256(url.encode()).hexdigest()[:24] + ext
-                resource['sha256'] = digest
-                (folder / resource['file']).write_bytes(body)
-                if request.is_navigation_request() and request.frame == page.main_frame and 'html' in mime:
-                    (folder / 'source.html').write_bytes(body)
-            meta['resources'].append(resource)
-            await route.fulfill(response=response, body=body)
-        except Exception as e:
-            meta['errors'].append({'url': url, 'error': str(e)[:400]})
-            try:
-                await route.abort()
-            except Exception:
-                pass
-
-    page = await context.new_page()
-    await context.route('**/*', route_handler)
-    page.on('pageerror', lambda e: meta['errors'].append({'javascript': str(e)[:500]}))
-    page.on('dialog', lambda dialog: dialog.dismiss())
-    try:
-        response = await page.goto(target, wait_until='domcontentloaded', timeout=45000)
-        meta['final_url'] = page.url
-        meta['http_status'] = response.status if response else None
-        if not response or response.status >= 400:
-            meta['status'] = 'http_failed'
-            return meta, folder
-        await page.wait_for_timeout(2000)
-        await page.evaluate('''async () => {
-          for (let i=0; i<16; i++) {
-            window.scrollBy(0, Math.max(650, innerHeight));
-            await new Promise(r => setTimeout(r, 120));
-            if (scrollY + innerHeight >= document.documentElement.scrollHeight) break;
-          }
-          window.scrollTo(0,0);
-        }''')
-        await page.wait_for_timeout(1000)
-        meta['page_title'] = await page.title()
-        body_text = await page.locator('body').inner_text(timeout=8000)
-        (folder / 'page_text.txt').write_text(body_text, encoding='utf-8')
-        if any(t in (meta['page_title'] + '\n' + body_text[:2000]).lower()
-               for t in ['just a moment', 'verify you are human', 'checking your browser', 'domain is for sale', 'buy this domain']):
+        page = await robots.fetch(target, max_bytes=4 * 1024**2, budget=budget)
+        meta['final_url'], meta['http_status'] = page['final_url'], page['status']
+        (folder / 'source.html').write_bytes(page['body'])
+        soup = BeautifulSoup(page['body'], 'html.parser')
+        meta['page_title'] = soup.title.get_text(' ', strip=True) if soup.title else ''
+        text = soup.get_text(' ', strip=True)
+        (folder / 'page_text.txt').write_text(text, encoding='utf-8')
+        if any(value in (meta['page_title'] + '\n' + text[:2000]).lower() for value in (
+                'just a moment', 'verify you are human', 'checking your browser', 'domain is for sale', 'buy this domain')):
             meta['status'] = 'blocked_or_parked'
             return meta, folder
-        dom = await page.content()
-        (folder / 'rendered.html').write_text(dom, encoding='utf-8')
-        meta['dimensions'] = await page.evaluate('({width:innerWidth,height:document.documentElement.scrollHeight})')
-        height = min(meta['dimensions']['height'], 32000)
-        await page.screenshot(path=str(folder / 'desktop.png'),
-                              clip={'x': 0, 'y': 0, 'width': 1440, 'height': max(1, height)},
-                              timeout=20000, animations='disabled')
-        await page.set_viewport_size({'width': 390, 'height': 844})
-        await page.wait_for_timeout(1000)
-        height = min(await page.evaluate('document.documentElement.scrollHeight'), 32000)
-        await page.screenshot(path=str(folder / 'mobile.png'),
-                              clip={'x': 0, 'y': 0, 'width': 390, 'height': max(1, height)},
-                              timeout=20000, animations='disabled')
-        meta['status'] = 'captured_partial' if meta['blocked'] or meta['errors'] else 'captured'
+        if page['mime'] and not any(t in page['mime'] for t in ('html', 'text/plain')):
+            meta['status'] = 'non_html'
+            return meta, folder
+        base = page['final_url']
+        queue = asyncio.Queue()
+        seen = {target, base}
+
+        def enqueue(url, depth=0):
+            full = urljoin(base, url)
+            parsed = urlsplit(full)
+            full = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ''))
+            if full in seen or not public_url(full):
+                return
+            seen.add(full)
+            if Path(parsed.path).suffix.lower() in MEDIA_EXT:
+                meta['blocked'].append({'url': full, 'reason': 'streaming_media'})
+                return
+            if len(seen) > args.max_resources + 2 or depth > 8:
+                meta['blocked'].append({'url': full, 'reason': 'resource_or_depth_budget'})
+                return
+            queue.put_nowait((full, depth))
+
+        for ref in html_references(soup, base):
+            enqueue(ref)
+
+        async def asset_worker():
+            while True:
+                url, depth = await queue.get()
+                temp = folder / 'assets' / (hashlib.sha256(url.encode()).hexdigest()[:24] + '.part')
+                try:
+                    result = await robots.fetch(url, destination=temp, budget=budget)
+                    mime = result['mime'].split(';')[0].strip().lower()
+                    url_ext = Path(urlsplit(result['final_url']).path).suffix
+                    ext = url_ext if mime in {'', 'application/octet-stream', 'text/plain'} else mimetypes.guess_extension(mime)
+                    ext = ext or url_ext or '.bin'
+                    if len(ext) > 10 or not re.fullmatch(r'\.[a-zA-Z0-9]+', ext):
+                        ext = '.bin'
+                    if 'javascript' in mime:
+                        ext = '.js'
+                    path = temp.with_suffix(ext)
+                    temp.replace(path)
+                    # Hash in bounded chunks; never hold multiple large binary assets in RAM.
+                    digest = hashlib.sha256()
+                    with path.open('rb') as handle:
+                        for chunk in iter(lambda: handle.read(65536), b''):
+                            digest.update(chunk)
+                    resource = {k: result[k] for k in ('url', 'final_url', 'status', 'mime', 'bytes')}
+                    resource.update(file=path.relative_to(folder).as_posix(), sha256=digest.hexdigest())
+                    meta['resources'].append(resource)
+                    asset_text = None
+                    if 'css' in mime or ext == '.css':
+                        asset_text = path.read_text(encoding=result['charset'], errors='replace')
+                        refs = css_references(asset_text)
+                    elif 'javascript' in mime or ext in {'.js', '.mjs'}:
+                        asset_text = path.read_text(encoding=result['charset'], errors='replace')
+                        refs = js_references(asset_text)
+                    elif 'html' in mime and depth < 2:
+                        refs = html_references(BeautifulSoup(path.read_bytes(), 'html.parser'), result['final_url'])
+                    else:
+                        refs = ()
+                    for ref in refs:
+                        enqueue(urljoin(result['final_url'], ref), depth + 1)
+                except Exception as e:
+                    message = str(e) or type(e).__name__
+                    if any(t in message for t in ('robots_', 'budget', 'backoff_')):
+                        meta['blocked'].append({'url': url, 'reason': message[:400]})
+                    else:
+                        meta['errors'].append({'url': url, 'error': message[:400]})
+                finally:
+                    temp.unlink(missing_ok=True)
+                    queue.task_done()
+
+        tasks = [asyncio.create_task(asset_worker()) for _ in range(args.asset_workers)]
+        await queue.join()
+        meta['status'] = 'downloaded_partial' if meta['blocked'] or meta['errors'] else 'downloaded'
+    except FetchError as e:
+        meta['status'] = 'robots_skipped' if 'robots_' in str(e) else 'http_failed' if e.status else 'failed'
+        meta['error'] = str(e)
+        meta['http_status'] = e.status
     except Exception as e:
-        meta['status'] = 'failed'
-        meta['error'] = str(e)[:1500]
+        meta['status'], meta['error'] = 'failed', str(e) or type(e).__name__
+    except asyncio.CancelledError:
+        meta['status'], meta['error'] = 'failed', 'site_timeout_or_interrupted'
+        raise
     finally:
-        await context.close()
-        meta['bytes_received'] = total
-        meta['resource_count'] = resource_count
-        if (folder / 'rendered.html').exists():
-            try:
-                offline_preview(folder, (folder / 'rendered.html').read_text(encoding='utf-8'),
-                                meta.get('final_url', target), meta['resources'])
-            except Exception as e:
-                meta['preview_error'] = str(e)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        meta['bytes_received'] = budget['bytes']
+        meta['resource_count'] = len(meta['resources'])
+        meta['elapsed_seconds'] = round(time.monotonic() - started, 3)
         atomic_json(folder / 'metadata.json', meta)
     return meta, folder
 
@@ -531,16 +645,22 @@ async def main(args):
     for name in ['sites', 'directory']:
         (out / name).mkdir(exist_ok=True)
     lock_path = out / 'crawl.lock'
-    if lock_path.exists():
-        raise RuntimeError('crawl.lock exists: check that no crawler is running before removing it')
-    lock_path.write_text(str(os.getpid()), encoding='utf-8')
+    try:
+        with lock_path.open('x', encoding='utf-8') as lock:
+            lock.write(str(os.getpid()))
+    except FileExistsError:
+        raise RuntimeError('crawl.lock exists: check that no crawler is running before removing it') from None
     store = Store(out)
     stop_event, done = asyncio.Event(), asyncio.Event()
     jobs = []
-    connector = aiohttp.TCPConnector(limit=40, limit_per_host=8)
+    connector = aiohttp.TCPConnector(limit=args.connections, limit_per_host=args.per_host, ttl_dns_cache=300)
     try:
         async with aiohttp.ClientSession(connector=connector, headers={'User-Agent': AGENT}) as session:
-            robots = Robots(session, out)
+            robots = Robots(session, out, args.connections)
+            store.setting('workers', args.workers)
+            store.setting('connections', args.connections)
+            store.setting('asset_workers', args.asset_workers)
+            store.setting('stop_reason', '')
             # The two public post sitemaps provide a concrete coverage inventory immediately.
             if not (out / 'sitemap_candidates.json').exists():
                 candidates = []
@@ -558,73 +678,93 @@ async def main(args):
                                'target': None, 'entry_kind': 'sitemap_candidate', 'discovered_at': now()},
                               commit=False)
             store.db.commit()
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                completed, claimed = 0, 0
-                store.phase = 'catalog_and_capture'
+            if args.retry_failed:
+                store.db.execute("UPDATE entries SET status='pending',error=NULL WHERE status IN ('failed','http_failed')")
+                store.db.commit()
+            completed, claimed = 0, 0
+            store.phase = 'catalog_and_download'
 
-                async def worker():
-                    nonlocal completed, claimed
-                    while not stop_event.is_set():
-                        if (out / 'STOP').exists():
-                            stop_event.set()
+            async def worker():
+                nonlocal completed, claimed
+                while not stop_event.is_set():
+                    if (out / 'STOP').exists():
+                        stop_event.set()
+                        return
+                    if shutil.disk_usage(out).free < 10 * 1024**3:
+                        store.setting('stop_reason', 'less_than_10GB_free')
+                        stop_event.set()
+                        return
+                    if args.limit and claimed >= args.limit:
+                        return
+                    record = store.pending()
+                    if not record:
+                        if done.is_set():
                             return
-                        if shutil.disk_usage(out).free < 10 * 1024**3:
-                            store.setting('stop_reason', 'less_than_10GB_free')
-                            stop_event.set()
-                            return
-                        if args.limit and claimed >= args.limit:
-                            return
-                        record = store.pending()
-                        if not record:
-                            if done.is_set():
-                                return
-                            await asyncio.sleep(1)
-                            continue
-                        store.status(record['url'], 'running')
-                        claimed += 1
-                        folder = None
-                        try:
-                            async with asyncio.timeout(130):
-                                meta, folder = await capture(browser, record, robots, out)
-                            record['title'] = meta['title']
-                            record['target'] = meta.get('target', record.get('target'))
+                        await asyncio.sleep(1)
+                        continue
+                    store.status(record['url'], 'running')
+                    claimed += 1
+                    folder = None
+                    try:
+                        async with asyncio.timeout(args.site_timeout):
+                            meta, folder = await capture(record, robots, out, args)
+                        record['title'] = meta['title']
+                        record['target'] = meta.get('target', record.get('target'))
+                        store.put(record)
+                        store.status(record['url'], meta['status'], str(folder.relative_to(out)), meta.get('error'))
+                    except Exception as e:
+                        # capture writes its metadata even on timeout; preserve its folder/target.
+                        slug = re.sub(r'[^a-zA-Z0-9._-]+', '-', urlsplit(record['url']).path.strip('/'))[:90] or 'site'
+                        folder = out / 'sites' / (slug + '-' + hashlib.sha256(record['url'].encode()).hexdigest()[:8])
+                        meta_path = folder / 'metadata.json'
+                        if meta_path.exists():
+                            interrupted = json.loads(meta_path.read_text(encoding='utf-8'))
+                            record['title'] = interrupted.get('title', record['title'])
+                            record['target'] = interrupted.get('target', record.get('target'))
                             store.put(record)
-                            store.status(record['url'], meta['status'], str(folder.relative_to(out)), meta.get('error'))
-                        except Exception as e:
-                            store.status(record['url'], 'failed', str(folder.relative_to(out)) if folder else None,
-                                         str(e) or type(e).__name__)
-                        completed += 1
-                        row = store.db.execute('SELECT status FROM entries WHERE url=?', (record['url'],)).fetchone()
-                        print(json.dumps({'event': 'capture', 'title': record['title'], 'status': row[0],
-                                          'completed_this_run': completed}, ensure_ascii=False), flush=True)
+                        store.status(record['url'], 'failed', str(folder.relative_to(out)) if folder else None,
+                                     str(e) or type(e).__name__)
+                    completed += 1
+                    store.completed = completed
+                    row = store.db.execute('SELECT status FROM entries WHERE url=?', (record['url'],)).fetchone()
+                    print(json.dumps({'event': 'download', 'title': record['title'], 'status': row[0],
+                                      'completed_this_run': completed}, ensure_ascii=False), flush=True)
 
-                async def heartbeat():
-                    while not stop_event.is_set():
-                        store.export()
-                        await asyncio.sleep(10)
+            async def heartbeat():
+                while not stop_event.is_set():
+                    store.export()
+                    await asyncio.sleep(10)
 
-                producer = asyncio.create_task(catalog(store, robots, args, done))
-                reporter = asyncio.create_task(heartbeat())
-                jobs = [asyncio.create_task(worker()) for _ in range(args.workers)]
+            producer = asyncio.create_task(catalog(store, robots, args, done))
+            reporter = asyncio.create_task(heartbeat())
+            jobs = [asyncio.create_task(worker()) for _ in range(args.workers)]
+            try:
                 await asyncio.gather(*jobs)
-                if not producer.done():
-                    producer.cancel()
-                await asyncio.gather(producer, return_exceptions=True)
-                stop_event.set()
-                reporter.cancel()
-                await asyncio.gather(reporter, return_exceptions=True)
-                await browser.close()
-                if (out / 'STOP').exists() or store.setting('stop_reason'):
-                    store.phase = 'stopped'
-                elif args.limit:
-                    store.phase = 'sample_complete'
-                elif store.setting('catalog_error'):
-                    store.phase = 'catalog_failed'
-                else:
-                    store.phase = 'complete'
-                print(json.dumps(store.export(), ensure_ascii=False), flush=True)
+            finally:
+                for job in jobs:
+                    if not job.done():
+                        job.cancel()
+                await asyncio.gather(*jobs, return_exceptions=True)
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            stop_event.set()
+            reporter.cancel()
+            await asyncio.gather(reporter, return_exceptions=True)
+            if (out / 'STOP').exists() or store.setting('stop_reason'):
+                store.phase = 'stopped'
+            elif args.limit:
+                store.phase = 'sample_complete'
+            elif store.setting('catalog_error'):
+                store.phase = 'catalog_failed'
+            else:
+                store.phase = 'complete'
+            print(json.dumps(store.export(), ensure_ascii=False), flush=True)
     finally:
+        for task in (locals().get('producer'), locals().get('reporter')):
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         store.export()
         store.db.close()
         lock_path.unlink(missing_ok=True)
@@ -634,7 +774,15 @@ if __name__ == '__main__':
     sys.stdout.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', default='data/onepagelove')
-    parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--workers', type=int, default=96, help='Concurrent website downloads; no browser')
+    parser.add_argument('--connections', type=int, default=384, help='Global HTTP connection/request limit')
+    parser.add_argument('--per-host', type=int, default=4, help='Connections per endpoint')
+    parser.add_argument('--asset-workers', type=int, default=8, help='Asset downloads per website')
+    parser.add_argument('--max-resources', type=int, default=500)
+    parser.add_argument('--site-timeout', type=int, default=120)
+    parser.add_argument('--retry-failed', action='store_true', help='Retry previous failed/http_failed entries once in this run')
     parser.add_argument('--limit', type=int, default=0, help='0 means all publicly listed inspiration pages')
     args = parser.parse_args()
+    if min(args.workers, args.connections, args.per_host, args.asset_workers, args.max_resources, args.site_timeout) < 1 or args.limit < 0:
+        parser.error('Concurrency, budget and timeout must be positive; limit must be nonnegative')
     asyncio.run(main(args))
